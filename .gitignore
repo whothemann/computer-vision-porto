@@ -1,0 +1,32 @@
+# --- Course data (not redistributed — owned by FEUP/VCOMP) ---
+data/
+notebooks/data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Optional: large output dumps ---
+# Uncomment if results/ ever gets big
+# results/*.png
+# results/*.jpg
