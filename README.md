@@ -1,195 +1,157 @@
-<table>
-<tr>
-<td width="70%" valign="middle">
+# Lego Brick Inspection — Computer Vision Pipeline
 
-# Cyclops Vision — Depth Estimation on Edge Hardware
+A classical computer vision pipeline for industrial-style inspection of Lego bricks: camera intrinsic calibration with reprojection-error model selection, distortion correction, HSV color segmentation, Hough-circle stud detection, contour-based size classification with pixel-to-mm conversion via chessboard extrinsics, and kit matching against a reference catalog with automatic fault diagnosis.
 
-[EDTH](https://eurodefense.tech/) · [Slides](https://schenker332.github.io/Cyclops-Vision-EDTH/Presentation/)
-
-</td>
-<td width="30%" align="right" valign="middle">
-	<img src="Logo_hackathon.png" alt="EuroDefense Hackathon logo" width="220" />
-</td>
-</tr>
-</table>
-
-Indoor fine-tuning of a ~1.3M-parameter monocular depth model for real-time
-inference on a Raspberry Pi 5. Built in 48 hours at the **European Defense
-Tech Hackathon Porto (April 2026) — 2nd place**.
+Built with **OpenCV** and **Python**. No deep learning — the entire pipeline is classical CV, end-to-end.
 
 ---
 
-<p align="center">
-	<img src="Vortrag.jpg" alt="Cyclops Vision team presenting the project live at the EuroDefense hackathon" width="1000" />
-</p>
+## Context
 
-<p align="center">
-	<i>Cyclops Vision presented live at the <a href="https://eurodefense.tech/">EDTH</a> hackathon.</i>
-</p>
+Coursework project for the Computer Vision course (VCOMP) at FEUP, University of Porto, 2026.
 
-## Results
+The premise: a factory inspection camera looks down at a tray of Lego bricks. The system must (1) detect each brick, (2) identify its color and size, (3) verify whether the tray matches one of three pre-defined kits, and (4) flag faulty kits along with the cause (missing brick, surplus brick, wrong type).
 
-Iterative fine-tuning of [RTMonoDepth_s](https://github.com/Ecalpal/RT-MonoDepth)
-(KITTI-pretrained) on 129 indoor iPhone images, with pseudo-GT depth maps
-distilled from
-[Depth Anything V3 Nested](https://github.com/DepthAnything/Depth-Anything-V3).
-Loss: scale-invariant log loss (SILog).
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Raw image                                                     │
+│      │                                                         │
+│      ▼                                                         │
+│  Intrinsic calibration ── 3 calib sets, pick lowest reproj.    │
+│      │                    error (best: k₁ ≈ −0.43, strong      │
+│      │                    barrel distortion)                   │
+│      ▼                                                         │
+│  Undistort + ROI crop ── cv.getOptimalNewCameraMatrix          │
+│      │                                                         │
+│      ▼                                                         │
+│  Extrinsic calibration ── solvePnP on chessboard               │
+│      │                    → pixel-to-mm scale factor           │
+│      ▼                                                         │
+│  HSV color segmentation ── multi-range masks per color         │
+│      │                    (handles lighting variation)         │
+│      ▼                                                         │
+│  Contour extraction ── filter by min area, find centroids      │
+│      │                                                         │
+│      ▼                                                         │
+│  Size classification ── area in mm² → {2x1, 2x2, R2x2,         │
+│      │                  2x4, 2x6} via reference dimensions     │
+│      ▼                                                         │
+│  Stud detection ── HoughCircles (cross-check size)             │
+│      │                                                         │
+│      ▼                                                         │
+│  Kit matching ── (color, size, count) signature →              │
+│                  closest pre-defined kit by L1 distance →      │
+│                  exact match / faulty + cause                  │
+└────────────────────────────────────────────────────────────────┘
+```
 
-| Version | Trainable params         | Val Loss | δ1     | δ2     | δ3     |
-|---------|--------------------------|----------|--------|--------|--------|
-| v1      | 15k (head only)          | 4.819    | ~29 %  | ~58 %  | ~78 %  |
-| v2      | 287k (head, weighted)    | collapsed| —      | —      | —      |
-| v3      | 392k (decoder + head)    | 4.607    | ~34 %  | ~62 %  | ~80 %  |
-| **v4**  | **945k (enc + dec + head)** | **4.414** | **34.2 %** | **64.0 %** | **82.0 %** |
+---
 
-For reference, state-of-the-art on NYU Depth v2 reaches δ1 ≈ 90 %, RMSE ≈ 0.35 m.
+## Pipeline Details
 
-Full training narrative, ablations and limitations:
-[`reports/training_report.md`](reports/training_report.md).
+### 1. Intrinsic calibration with model selection
+Three independent calibration sets (34 chessboard images each, 12×9 inner corners, 15 mm squares) are processed with `cv.findChessboardCorners` + `cv.cornerSubPix` + `cv.calibrateCamera`. The set with the lowest reprojection error is selected — this turns out to have a strong barrel distortion (k₁ ≈ −0.43), which materially affects downstream measurements and is the reason undistortion isn't optional here.
 
-<p align="center">
-	<img src="Software.png" alt="Cyclops Vision software demo: depth output and finetuned comparison" width="1000" />
-</p>
+### 2. Extrinsic calibration and pixel-to-mm
+`final_setup.png` (the inspection-arrangement image) is undistorted with the best intrinsic matrix, then `cv.solvePnP` recovers the extrinsic matrix from the chessboard. The mean horizontal corner spacing in the undistorted image gives the pixel-to-mm conversion factor used for all later area measurements.
 
-<p align="center">
-	<i>Software demo: predicted depth field, base model vs. finetuned output.</i>
-</p>
+A subtle point handled correctly here: after `getOptimalNewCameraMatrix`, the principal point is shifted, so corner coordinates and any later size computation must stay in the new (undistorted) coordinate frame — no cropping with the returned ROI before `solvePnP`.
 
-## Deployment
+### 3. Color segmentation (HSV, multi-range)
+Single-range HSV masks fail under uneven lighting — bricks of the "same" color shift noticeably across an image. Each color uses two HSV ranges OR'd together (one for the brighter side, one for the shadowed side):
 
-| Metric                              | Value                |
-|-------------------------------------|----------------------|
-| Model size (ONNX, FP32)             | ~5 MB                |
-| Inference, Raspberry Pi 5 (CPU)     | ~5–10 FPS @ 192×640  |
-| Runtime dependencies on the Pi      | `onnxruntime`, `numpy`, `pillow` (no PyTorch) |
-| Input                               | RGB image, [0, 1]    |
-| Output                              | Metric depth, 0.1–10 m |
+```python
+blue1   = ([100, 124,  85], [110, 255, 255])
+blue2   = ([105, 180,  50], [115, 255, 255])  # darker variant
+green1  = ([ 42,  95,  60], [ 49, 255, 255])
+green2  = ([ 34,  80, 150], [ 44, 255, 255])  # lighter variant
+red1    = ([  1, 150,  40], [ 10, 255, 150])
+red2    = ([171, 150,  40], [180, 255, 150])  # red wraps around H=0
+yellow1 = ([ 13, 145,   1], [ 21, 255, 255])
+yellow2 = ([ 22, 120, 160], [ 25, 255, 255])
+```
 
-`depth_model_pi.onnx` in this repo is the v4 export ready to drop on the Pi.
+The red ranges also handle the H-wrap at 0/180. Ranges were tuned empirically from the supplied dataset.
 
-## What's hard about this problem
+### 4. Contour-based size classification
+After masking, contours are extracted and filtered by a minimum area threshold (500 px²) to drop noise. Each contour's area is converted to mm² using the calibration factor, then matched to one of the five reference brick footprints (2x1, 2x2, R2x2, 2x4, 2x6) by closest area.
 
-A few honest notes — the δ1 of 34 % vs. SOTA's ~90 % isn't an architecture
-problem. It's a data problem:
+### 5. Stud detection (cross-check)
+`HoughCircles` is run on grayscale crops to count studs per brick, providing an independent check on the area-based size classification.
 
-- **129 images, 2–3 rooms.** NYU Depth v2 has 47k images from 464 rooms.
-  The model has very little to generalize over, and consecutive frames
-  from the same scene are highly correlated.
-- **Pseudo-GT, not measurement.** The supervision signal comes from a
-  larger transformer (Depth Anything V3 Nested), so the student inherits
-  the teacher's errors. Real LiDAR or structured light would give a
-  cleaner target.
-- **Domain gap.** The KITTI-pretrained encoder learned outdoor dashcam
-  scenes (0–80 m). Indoor (0.5–8 m, handheld) is a very different prior;
-  unfreezing only the last encoder block helps but doesn't bridge the gap
-  with this little data.
-- **Edge constraints.** 5 MB model, no GPU, no PyTorch on the Pi. ONNX
-  export is the deployment story; the training script is desktop-only.
+### 6. Kit matching and fault diagnosis
+Each detected scene is reduced to a `(color, size) → count` signature. For inspection images A, B, C, the L1 distance is computed against each pre-defined kit signature (Kit 1, Kit 2, Kit 3); the closest is reported as a match (`diff = 0`) or as a fault with the diff vector indicating which bricks are missing or in surplus.
 
-With 500+ images from 20+ rooms and a fully-unfrozen encoder, δ1 > 60 % is
-realistic.
+---
 
+## What's Hard About This Problem
 
-## Setup
+The instinct is "it's just colored blocks on a white background, segment by color and you're done." The actual difficulties:
+
+- **Strong barrel distortion** (k₁ ≈ −0.43). Bricks far from the principal point measure significantly smaller in pixels than identical bricks at the center if you skip undistortion. Without correction, size classification is unreliable across the image.
+- **Lighting non-uniformity.** Each color needs at least two HSV ranges to handle bright vs. shadowed regions of the same brick.
+- **Reference frame consistency.** The pixel-to-mm factor is only valid in the undistorted coordinate system with the new camera matrix — mixing it with raw image coordinates silently breaks the size classification.
+- **R2x2 vs. 2x2 disambiguation.** Same area, different shape (R2x2 is rectangular). Raw area thresholding isn't enough; aspect ratio of the contour bounding box is used as a tie-breaker.
+
+---
+
+## Repository Layout
+
+```
+.
+├── notebooks/
+│   └── main.ipynb           # End-to-end pipeline, all 4 tasks
+├── results/                 # Saved output figures (detection overlays,
+│                            # calibration tables, kit-match results)
+├── requirements.txt
+├── .gitignore
+└── README.md
+```
+
+The original `data/` folder (calibration chessboards, isolated brick images, kit images, fault images) is **not** included — those images are course material and aren't redistributed here. The notebook expects:
+
+```
+data/
+├── Calibration/
+│   ├── calib1/calib_0.png … calib_33.png
+│   ├── calib2/…
+│   ├── calib3/…
+│   └── final_setup.png
+├── Isolated/
+│   ├── colored_bricks.png
+│   ├── blue.png · green.png · red.png · yellow.png
+├── Kit/
+│   ├── kit1.png · kit2.png · kit3.png
+│   └── ImageA_kit.png · ImageB_kit.png · ImageC_kit.png
+└── Fault/
+    └── fault_*.png
+```
+
+---
+
+## Running
 
 ```bash
-git clone <this repo>
-cd cyclops-vision-depth
-python -m venv venv && source venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+jupyter lab notebooks/main.ipynb
 ```
 
-### 1. Pretrained KITTI weights (required for training and PyTorch inference)
+Run cells top to bottom. The pipeline is self-contained and produces the result tables and detection overlay figures inline.
 
-Download `encoder.pth` and `depth.pth` from the upstream RT-MonoDepth repo
-([Google Drive link](https://drive.google.com/file/d/1Jf5K3m0DfAqVcVCE6y0cKufEKIHu86sz/view?usp=drive_link),
-maintained by the original authors) and place them in `./weights/`:
+---
 
-```
-weights/
-├── encoder.pth
-└── depth.pth
-```
+## Tooling
 
-These are licensed for **non-commercial use only** under the Monodepth2
-licence and are not redistributed here.
+- Python 3.11
+- OpenCV 4.x (`cv2`)
+- NumPy, Pandas
+- Matplotlib (visualization)
+- Jupyter
 
-### 2. Training data (not redistributed)
+---
 
-We trained on 129 iPhone photos taken inside the hackathon venue. Several of
-them contain **identifiable people**, so we can't publish the dataset.
+## Author
 
-To reproduce the training pipeline on your own indoor photos:
-
-1. Capture / collect indoor images, save as `IMG_<id>.jpg` in
-   `./ground_truth/image_gt/`.
-2. Generate pseudo-GT metric depth maps with
-   [Depth Anything V3 Nested](https://github.com/DepthAnything/Depth-Anything-V3)
-   (follow the upstream instructions; it's a separate model with its own
-   licence). Save each as `depth_IMG_<id>_metric.npy` (float32, units of metres)
-   in `./ground_truth/depth/`.
-3. Edit the `ALL_IDS` / `VAL_IDS` lists in `finetune_indoor.py` to point at
-   your IDs.
-
-### 3. Train
-
-```bash
-python finetune_indoor.py --epochs 50
-```
-
-Defaults reproduce the v4 setup: encoder `convs[2]` unfrozen at lr=5e-8,
-decoder at lr=1e-6, refinement head at lr=1e-3, StepLR (×0.1 every 20 epochs).
-Best weights are saved to `./weights_finetuned_v4/`.
-
-### 4. Export to ONNX
-
-```bash
-python export_for_pi.py                  # FP32, ~5 MB
-python export_for_pi.py --quantize       # INT8, ~2× faster on the Pi
-```
-
-### 5. Run on the Pi 5
-
-```bash
-# On the Pi (one-time):
-pip install -r requirements-pi.txt
-
-# Then:
-python3 infer_pi.py --image photo.jpg
-python3 infer_pi.py --image photos/      # folder
-```
-
-## Limitations
-
-See [`reports/training_report.md`](reports/training_report.md) for the
-full version. Short version: 129 images is too few; pseudo-GT is not real
-measurement; the KITTI prior helps less indoors than we hoped. We're
-publishing the work as an honest 48-hour engineering snapshot, not a
-finished research result.
-
-## License
-
-- **Our code** (`finetune_indoor.py`, `infer_indoor_refined.py`,
-  `infer_pi.py`, `export_for_pi.py`, `networks/refinement_head.py`,
-  `datasets/indoor_dataset.py`) is released under the **MIT license** —
-  see [`LICENSE`](LICENSE).
-- **`layers.py`** and **`networks/RTMonoDepth/RTMonoDepth_s.py`** retain
-  their original "Copyright Niantic 2019 — non-commercial only" headers.
-- The KITTI pretrained weights and the Depth Anything V3 Nested pseudo-GT
-  also carry their own (non-commercial) licences and are not bundled.
-
-## Team
-
-- Lars Husemann
-- Niclas Schenk
-- Luca Ohnheiser
-
-## Acknowledgments
-
-- [RT-MonoDepth](https://github.com/Ecalpal/RT-MonoDepth) (Feng et al., ICIP 2024)
-  for the small-model architecture and KITTI-pretrained weights.
-- [Monodepth2](https://github.com/nianticlabs/monodepth2) (Niantic) for the
-  underlying depth-decoder code.
-- [Depth Anything V3](https://github.com/DepthAnything/Depth-Anything-V3) for
-  the teacher model used to distil pseudo-GT depth.
-- The European Defense Tech Hackathon Porto organisers and mentors.
+Lars Husemann — M.Sc. Electrical and Computer Engineering, TU Munich (Erasmus semester at FEUP, University of Porto).
